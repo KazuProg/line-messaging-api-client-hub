@@ -17,8 +17,8 @@ COPY --from=builder /webhook-hub /app/webhook-hub
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-ENV PORT=80
+ENV PORT=8080
 
-EXPOSE 80
+EXPOSE 8080
 
 ENTRYPOINT ["/app/entrypoint.sh"]
