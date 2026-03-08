@@ -1,12 +1,11 @@
-# Webhook Hub & Archiver
+# Webhook Hub
 
-LINE Messaging API の Webhook を受信・アーカイブし、複数の子 Webhook クライアントへ非同期転送する軽量ハブです。
+LINE Messaging API の Webhook を受信し、複数の子 Webhook クライアントへ非同期転送する軽量ハブです。
 
 ## 特徴
 
 - `POST /callback` で LINE Webhook を受信
 - `x-line-signature` と `LINE_CHANNEL_SECRET` による HMAC-SHA256 署名検証
-- SQLite3 に Webhook ペイロードをアーカイブ（`webhooks` テーブル）
 - 登録された転送先 URL 一覧（JSON ファイル + メモリ）へ非同期 HTTP POST
 - 転送結果を構造化 JSON ログ（`log/slog`）として標準出力に出力
 - `GET /health` のヘルスチェックエンドポイント
@@ -20,7 +19,6 @@ LINE Messaging API の Webhook を受信・アーカイブし、複数の子 Web
 ## 環境変数
 
 - `LINE_CHANNEL_SECRET` (必須): LINE チャネルシークレット。署名検証に使用します。
-- `DB_PATH` (任意): SQLite DB ファイルパス。デフォルトは `/data/webhook.db`。
 - `CLIENTS_FILE` (任意): 転送先 URL 一覧を保存する JSON ファイルパス。デフォルトは `/data/clients.json`。起動時に読み込み、追加時に書き戻します。
 - `PORT` (任意): HTTP リッスンポート。デフォルトは `8080`。
 

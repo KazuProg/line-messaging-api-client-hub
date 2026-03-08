@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,13 +14,10 @@ import (
 	"os"
 	"strconv"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
 	defaultPort        = "80"
-	defaultDBPath      = "/data/webhook.db"
 	defaultClientsFile = "/data/clients.json"
 	maxRequestBodySize = 1 << 20 // 1MB
 )
@@ -34,11 +30,9 @@ type webhookPayload struct {
 
 type appConfig struct {
 	Port            string
-	DBPath          string
 	ClientsFilePath string
 	ChannelSecret   string
 	Logger          *slog.Logger
-	DB              *sql.DB
 	Clients         *clientStore
 	HTTPClient      *http.Client
 	RequestTimeout  time.Duration
@@ -55,21 +49,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := openDB(cfg.DBPath, logger)
-	if err != nil {
-		logger.Error("failed to open database", "error", err.Error())
-		os.Exit(1)
-	}
-	defer db.Close()
-
-	cfg.DB = db
 	cfg.HTTPClient = &http.Client{
 		Timeout: cfg.RequestTimeout,
-	}
-
-	if err := initSchema(db, logger); err != nil {
-		logger.Error("failed to initialize database schema", "error", err.Error())
-		os.Exit(1)
 	}
 
 	clients, err := newClientStore(cfg.ClientsFilePath, logger)
@@ -103,11 +84,6 @@ func newConfig(logger *slog.Logger) (*appConfig, error) {
 		port = defaultPort
 	}
 
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = defaultDBPath
-	}
-
 	clientsFile := os.Getenv("CLIENTS_FILE")
 	if clientsFile == "" {
 		clientsFile = defaultClientsFile
@@ -120,44 +96,11 @@ func newConfig(logger *slog.Logger) (*appConfig, error) {
 
 	return &appConfig{
 		Port:            port,
-		DBPath:          dbPath,
 		ClientsFilePath: clientsFile,
 		ChannelSecret:   secret,
 		Logger:          logger,
 		RequestTimeout:  5 * time.Second,
 	}, nil
-}
-
-func openDB(path string, logger *slog.Logger) (*sql.DB, error) {
-	// Enable WAL mode via connection string pragma.
-	dsn := path + "?_journal_mode=WAL&_foreign_keys=on"
-	db, err := sql.Open("sqlite3", dsn)
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-
-	logger.Info("database opened", "path", path)
-	return db, nil
-}
-
-func initSchema(db *sql.DB, logger *slog.Logger) error {
-	schema := `
-CREATE TABLE IF NOT EXISTS webhooks (
-	id TEXT PRIMARY KEY,
-	payload TEXT NOT NULL
-);`
-
-	if _, err := db.Exec(schema); err != nil {
-		return err
-	}
-	logger.Info("database schema initialized")
-	return nil
 }
 
 func callbackHandler(cfg *appConfig) http.Handler {
@@ -189,12 +132,6 @@ func callbackHandler(cfg *appConfig) http.Handler {
 		}
 
 		eventID := extractEventID(body)
-		if err := archiveWebhook(cfg.DB, eventID, string(body)); err != nil {
-			cfg.Logger.Error("failed to archive webhook", "error", err.Error(), "event_id", eventID)
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-
 		go forwardToClients(cfg, eventID, body)
 
 		w.WriteHeader(http.StatusOK)
@@ -322,11 +259,6 @@ func extractEventID(body []byte) string {
 func fallbackEventID() string {
 	ms := time.Now().UnixNano() / int64(time.Millisecond)
 	return "unknown-" + strconv.FormatInt(ms, 10)
-}
-
-func archiveWebhook(db *sql.DB, id, payload string) error {
-	_, err := db.Exec(`INSERT OR IGNORE INTO webhooks (id, payload) VALUES (?, ?)`, id, payload)
-	return err
 }
 
 func forwardToClients(cfg *appConfig, eventID string, body []byte) {
