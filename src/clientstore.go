@@ -7,8 +7,7 @@ import (
 	"sync"
 )
 
-// Client is a registered webhook destination.
-// Required is true when delivery must succeed for LINE to receive 200; if any required client fails, LINE gets 5xx.
+// Required: if true, any failure to this client causes LINE to receive 5xx (retry).
 type Client struct {
 	WebhookURL string `json:"webhook_url"`
 	Required   bool   `json:"required"`
@@ -48,17 +47,29 @@ func (s *clientStore) load() error {
 	return nil
 }
 
-func (s *clientStore) persist() error {
-	s.mu.RLock()
-	clients := make([]Client, len(s.clients))
-	copy(clients, s.clients)
-	s.mu.RUnlock()
+// snapshotAndUnlock: caller must hold s.mu.Lock().
+func (s *clientStore) snapshotAndUnlock() []Client {
+	snapshot := make([]Client, len(s.clients))
+	copy(snapshot, s.clients)
+	s.mu.Unlock()
+	return snapshot
+}
 
+// persistWith: caller must not hold s.mu.
+func (s *clientStore) persistWith(clients []Client) error {
 	data, err := json.MarshalIndent(clients, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(s.filePath, data, 0644)
+}
+
+func (s *clientStore) persist() error {
+	s.mu.RLock()
+	clients := make([]Client, len(s.clients))
+	copy(clients, s.clients)
+	s.mu.RUnlock()
+	return s.persistWith(clients)
 }
 
 func (s *clientStore) List() []Client {
@@ -69,19 +80,16 @@ func (s *clientStore) List() []Client {
 	return out
 }
 
-// Add registers or updates a client by URL. If the URL already exists, Required is overwritten.
 func (s *clientStore) Add(url string, required bool) (updated bool, err error) {
 	s.mu.Lock()
 	for i := range s.clients {
 		if s.clients[i].WebhookURL == url {
 			s.clients[i].Required = required
-			s.mu.Unlock()
-			return true, s.persist()
+			return true, s.persistWith(s.snapshotAndUnlock())
 		}
 	}
 	s.clients = append(s.clients, Client{WebhookURL: url, Required: required})
-	s.mu.Unlock()
-	return false, s.persist()
+	return false, s.persistWith(s.snapshotAndUnlock())
 }
 
 func (s *clientStore) Remove(url string) (removed bool, err error) {
@@ -89,8 +97,7 @@ func (s *clientStore) Remove(url string) (removed bool, err error) {
 	for i, c := range s.clients {
 		if c.WebhookURL == url {
 			s.clients = append(s.clients[:i], s.clients[i+1:]...)
-			s.mu.Unlock()
-			return true, s.persist()
+			return true, s.persistWith(s.snapshotAndUnlock())
 		}
 	}
 	s.mu.Unlock()
