@@ -21,6 +21,7 @@ const (
 	defaultPort        = "80"
 	defaultClientsFile = "/data/clients.json"
 	maxRequestBodySize = 1 << 20 // 1MB
+	maxClientsBodySize = 64 << 10 // 64KB
 )
 
 type webhookPayload struct {
@@ -192,6 +193,7 @@ func clientsHandler(cfg *appConfig) http.Handler {
 			_ = json.NewEncoder(w).Encode(list)
 
 		case http.MethodPost:
+			r.Body = http.MaxBytesReader(w, r.Body, maxClientsBodySize)
 			var req clientRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
@@ -214,6 +216,7 @@ func clientsHandler(cfg *appConfig) http.Handler {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"webhook_url": req.WebhookURL, "required": req.Required})
 
 		case http.MethodDelete:
+			r.Body = http.MaxBytesReader(w, r.Body, maxClientsBodySize)
 			var req clientRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
