@@ -8,11 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -125,21 +125,40 @@ func callbackHandler(cfg *appConfig) http.Handler {
 			return
 		}
 
-		if !verifySignature(cfg.ChannelSecret, sig, body) {
+		if !verifySignature(cfg.ChannelSecret, sig, body, cfg.Logger) {
 			cfg.Logger.Warn("signature verification failed")
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
 		}
 
-		urls := cfg.Clients.List()
-		if len(urls) == 0 {
+		clients := cfg.Clients.List()
+		if len(clients) == 0 {
 			cfg.Logger.Warn("no webhook clients registered; rejecting webhook")
 			http.Error(w, "no webhook clients registered", http.StatusServiceUnavailable)
 			return
 		}
 
 		eventID := extractEventID(body)
-		go forwardToClients(cfg, eventID, body)
+		var required, optional []Client
+		for _, c := range clients {
+			if c.Required {
+				required = append(required, c)
+			} else {
+				optional = append(optional, c)
+			}
+		}
+
+		if len(required) > 0 {
+			if err := forwardToRequiredSync(cfg, eventID, body, required); err != nil {
+				cfg.Logger.Error("required client delivery failed", "error", err.Error(), "event_id", eventID)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if len(optional) > 0 {
+			go forwardToClients(cfg, eventID, body, optional)
+		}
 
 		w.WriteHeader(http.StatusOK)
 	})
@@ -152,9 +171,9 @@ func healthHandler() http.Handler {
 	})
 }
 
-// clientRequest is the JSON body for POST/DELETE /clients.
 type clientRequest struct {
 	WebhookURL string `json:"webhook_url"`
+	Required   bool   `json:"required"` // if true, any failure to this client causes LINE to receive 5xx (retry)
 }
 
 const clientsAllowMethods = "GET, POST, DELETE"
@@ -167,7 +186,7 @@ func clientsHandler(cfg *appConfig) http.Handler {
 		case http.MethodGet:
 			list := cfg.Clients.List()
 			if list == nil {
-				list = []string{}
+				list = []Client{}
 			}
 			_ = json.NewEncoder(w).Encode(list)
 
@@ -183,20 +202,15 @@ func clientsHandler(cfg *appConfig) http.Handler {
 				_, _ = w.Write([]byte(`{"error":"webhook_url is required"}`))
 				return
 			}
-			added, err := cfg.Clients.Add(req.WebhookURL)
+			_, err := cfg.Clients.Add(req.WebhookURL, req.Required)
 			if err != nil {
 				cfg.Logger.Error("failed to add client", "error", err.Error())
 				http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 				return
 			}
-			if !added {
-				w.WriteHeader(http.StatusConflict)
-				_, _ = w.Write([]byte(`{"error":"webhook_url already registered"}`))
-				return
-			}
-			cfg.Logger.Info("client registered", "webhook_url", req.WebhookURL)
-			w.WriteHeader(http.StatusCreated)
-			_ = json.NewEncoder(w).Encode(map[string]string{"webhook_url": req.WebhookURL})
+			cfg.Logger.Info("client registered", "webhook_url", req.WebhookURL, "required", req.Required)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"webhook_url": req.WebhookURL, "required": req.Required})
 
 		case http.MethodDelete:
 			var req clientRequest
@@ -231,7 +245,7 @@ func clientsHandler(cfg *appConfig) http.Handler {
 	})
 }
 
-func verifySignature(secret, signature string, body []byte) bool {
+func verifySignature(secret, signature string, body []byte, logger *slog.Logger) bool {
 	if secret == "" {
 		// Without secret, verification is meaningless; fail closed.
 		return false
@@ -239,7 +253,7 @@ func verifySignature(secret, signature string, body []byte) bool {
 
 	mac := hmac.New(sha256.New, []byte(secret))
 	if _, err := mac.Write(body); err != nil {
-		log.Printf("failed to compute hmac: %v", err)
+		logger.Error("failed to compute hmac", "error", err)
 		return false
 	}
 	expected := mac.Sum(nil)
@@ -268,9 +282,59 @@ func fallbackEventID() string {
 	return "unknown-" + strconv.FormatInt(ms, 10)
 }
 
-func forwardToClients(cfg *appConfig, eventID string, body []byte) {
-	urls := cfg.Clients.List()
-	for _, url := range urls {
+func forwardToRequiredSync(cfg *appConfig, eventID string, body []byte, required []Client) error {
+	var wg sync.WaitGroup
+	var firstErrMu sync.Mutex
+	var firstErr error
+	for _, c := range required {
+		wg.Add(1)
+		go func(url string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, io.NopCloser(io.LimitReader(io.MultiReader(bytesReader(body)), int64(len(body)))))
+			if err != nil {
+				cfg.Logger.Error("failed to create forwarding request", "error", err.Error(), "event_id", eventID, "url", url)
+				firstErrMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				firstErrMu.Unlock()
+				return
+			}
+			req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+			resp, err := cfg.HTTPClient.Do(req)
+			if err != nil {
+				cfg.Logger.Error("forwarding failed", "error", err.Error(), "event_id", eventID, "url", url)
+				firstErrMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				firstErrMu.Unlock()
+				return
+			}
+			_ = resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				cfg.Logger.Info("forwarding success", "event_id", eventID, "url", url)
+			} else {
+				cfg.Logger.Error("forwarding failed", "event_id", eventID, "url", url, "status", resp.StatusCode)
+				firstErrMu.Lock()
+				if firstErr == nil {
+					firstErr = errors.New("required client returned non-2xx: " + strconv.Itoa(resp.StatusCode))
+				}
+				firstErrMu.Unlock()
+			}
+		}(c.WebhookURL)
+	}
+	wg.Wait()
+	return firstErr
+}
+
+func forwardToClients(cfg *appConfig, eventID string, body []byte, clients []Client) {
+	for _, c := range clients {
 		go func(url string) {
 			ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 			defer cancel()
@@ -294,11 +358,10 @@ func forwardToClients(cfg *appConfig, eventID string, body []byte) {
 			} else {
 				cfg.Logger.Error("forwarding failed", "event_id", eventID, "url", url, "status", resp.StatusCode)
 			}
-		}(url)
+		}(c.WebhookURL)
 	}
 }
 
-// bytesReader returns an io.Reader over the given byte slice without extra allocation.
 func bytesReader(b []byte) io.Reader {
 	return &byteSliceReader{b: b}
 }
