@@ -8,9 +8,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -20,10 +23,12 @@ import (
 )
 
 const (
-	defaultPort        = "80"
-	defaultClientsFile = "/data/clients.json"
-	maxRequestBodySize = 1 << 20 // 1MB
-	maxClientsBodySize = 64 << 10 // 64KB
+	defaultPort           = "80"
+	defaultClientsFile    = "/data/clients.json"
+	maxRequestBodySize    = 1 << 20  // 1MB
+	maxClientsBodySize    = 64 << 10 // 64KB
+	maxLineAPIProxyBody   = 10 << 20 // 10MB
+	defaultLineAPIBaseURL = "https://api.line.me"
 )
 
 type webhookPayload struct {
@@ -33,13 +38,15 @@ type webhookPayload struct {
 }
 
 type appConfig struct {
-	Port            string
-	ClientsFilePath string
-	ChannelSecret   string
-	Logger          *slog.Logger
-	Clients         *clientStore
-	HTTPClient      *http.Client
-	RequestTimeout  time.Duration
+	Port                   string
+	ClientsFilePath        string
+	ChannelSecret          string
+	LineChannelAccessToken string
+	LineAPIBaseURL         *url.URL
+	Logger                 *slog.Logger
+	Clients                *clientStore
+	HTTPClient             *http.Client
+	RequestTimeout         time.Duration
 }
 
 func main() {
@@ -68,6 +75,7 @@ func main() {
 	mux.Handle("/callback", callbackHandler(cfg))
 	mux.Handle("/health", healthHandler())
 	mux.Handle("/clients", clientsHandler(cfg))
+	mux.Handle("/line-api/", http.StripPrefix("/line-api", lineAPIProxyHandler(cfg)))
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -111,12 +119,28 @@ func newConfig(logger *slog.Logger) (*appConfig, error) {
 		logger.Warn("LINE_CHANNEL_SECRET is not set; signature verification will always fail")
 	}
 
+	lineAPIBase := os.Getenv("LINE_API_BASE_URL")
+	if lineAPIBase == "" {
+		lineAPIBase = defaultLineAPIBaseURL
+	}
+	lineAPIURL, err := url.Parse(lineAPIBase)
+	if err != nil || lineAPIURL.Scheme == "" || lineAPIURL.Host == "" {
+		return nil, fmt.Errorf("invalid LINE_API_BASE_URL: %q", lineAPIBase)
+	}
+
+	accessToken := os.Getenv("LINE_CHANNEL_ACCESS_TOKEN")
+	if accessToken == "" {
+		logger.Info("LINE_CHANNEL_ACCESS_TOKEN is not set; /line-api/ proxy returns 503")
+	}
+
 	return &appConfig{
-		Port:            port,
-		ClientsFilePath: clientsFile,
-		ChannelSecret:   secret,
-		Logger:          logger,
-		RequestTimeout:  5 * time.Second,
+		Port:                   port,
+		ClientsFilePath:        clientsFile,
+		ChannelSecret:          secret,
+		LineChannelAccessToken: accessToken,
+		LineAPIBaseURL:         lineAPIURL,
+		Logger:                 logger,
+		RequestTimeout:         5 * time.Second,
 	}, nil
 }
 
@@ -268,6 +292,36 @@ func clientsHandler(cfg *appConfig) http.Handler {
 	})
 }
 
+func lineAPIProxyHandler(cfg *appConfig) http.Handler {
+	if cfg.LineChannelAccessToken == "" {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "LINE API proxy not configured", http.StatusServiceUnavailable)
+		})
+	}
+
+	target := cfg.LineAPIBaseURL
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	origDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Host = req.URL.Host
+		req.Header.Del("Authorization")
+		req.Header.Set("Authorization", "Bearer "+cfg.LineChannelAccessToken)
+	}
+	if cfg.HTTPClient.Transport != nil {
+		proxy.Transport = cfg.HTTPClient.Transport
+	} else {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.ResponseHeaderTimeout = cfg.RequestTimeout
+		proxy.Transport = t
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxLineAPIProxyBody)
+		proxy.ServeHTTP(w, r)
+	})
+}
+
 func verifySignature(secret, signature string, body []byte, logger *slog.Logger) bool {
 	if secret == "" {
 		// Without secret, verification is meaningless; fail closed.
@@ -384,4 +438,3 @@ func forwardToClients(cfg *appConfig, eventID string, body []byte, clients []Cli
 		}(c.WebhookURL)
 	}
 }
-
